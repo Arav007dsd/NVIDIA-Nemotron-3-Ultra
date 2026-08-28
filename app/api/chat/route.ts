@@ -28,8 +28,6 @@ export async function POST(req: Request) {
       ? [{ role: "user" as const, content: `PROJECT CONTEXT:\n${projectContext}` }]
       : [];
 
-    // NVIDIA-specific chat_template options are accepted by the NVIDIA endpoint,
-    // but are not present in every OpenAI SDK version's TypeScript definitions.
     const requestOptions = {
       model: MODEL,
       messages: [
@@ -49,13 +47,13 @@ export async function POST(req: Request) {
       },
     } as any;
 
-    const stream = await client.chat.completions.create(requestOptions);
+    const stream = (await client.chat.completions.create(requestOptions)) as unknown as AsyncIterable<any>;
     const encoder = new TextEncoder();
     const readable = new ReadableStream({
       async start(controller) {
         try {
           for await (const chunk of stream) {
-            const content = chunk.choices?.[0]?.delta?.content;
+            const content = chunk?.choices?.[0]?.delta?.content;
             if (content) {
               controller.enqueue(
                 encoder.encode(`data: ${JSON.stringify({ type: "content", content })}\n\n`)
