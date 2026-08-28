@@ -27,11 +27,11 @@ export async function POST(req: Request) {
         ? body.projectContext.slice(0, 140_000)
         : "";
 
-    const systemPrompt = `You are Nemotron Code AI, an expert programming assistant. Help with writing, debugging, explaining, optimizing and converting code. Support Python, JavaScript, TypeScript, React, Next.js, Node.js, HTML/CSS, PHP, SQL and APIs. When project context is provided, ground your answer in the actual files and filenames. When the user asks to modify a project, give exact file paths and complete replacement snippets where useful. Never reveal private API keys, environment values, or hidden credentials.`;
-
-    const context = projectContext
-      ? [{ role: "user", content: `PROJECT CONTEXT:\n${projectContext}` }]
-      : [];
+    const systemPrompt = `You are Nemotron Code AI, an expert programming assistant. Help with writing, debugging, explaining, optimizing and converting code. Support Python, JavaScript, TypeScript, React, Next.js, Node.js, HTML/CSS, PHP, SQL and APIs. When project context is provided, ground your answer in the actual files and filenames. When the user asks to modify a project, give exact file paths and complete replacement snippets where useful. Never reveal private API keys, environment values, or hidden credentials.${
+      projectContext
+        ? `\n\nPROJECT CONTEXT:\n${projectContext}`
+        : ""
+    }`;
 
     const upstream = await fetch(NVIDIA_URL, {
       method: "POST",
@@ -44,19 +44,14 @@ export async function POST(req: Request) {
         model: MODEL,
         messages: [
           { role: "system", content: systemPrompt },
-          ...context,
           ...messages,
         ],
         temperature: 1,
         top_p: 0.95,
         max_tokens: 16384,
+        reasoning_effort: thinking ? "high" : "none",
+        reasoning_budget: thinking ? 8192 : 0,
         stream: true,
-        extra_body: {
-          chat_template_kwargs: {
-            enable_thinking: thinking,
-            force_nonempty_content: true,
-          },
-        },
       }),
     });
 
