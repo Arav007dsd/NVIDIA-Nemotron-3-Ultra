@@ -20,18 +20,54 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json();
-    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const incomingMessages = Array.isArray(body?.messages) ? body.messages : [];
     const thinking = Boolean(body?.thinking);
     const projectContext =
       typeof body?.projectContext === "string"
         ? body.projectContext.slice(0, 140_000)
         : "";
 
+    // NVIDIA requires the last message to be a user message and the
+    // user/assistant messages to alternate. The client already sends that shape.
+    const messages = incomingMessages.filter(
+      (message: unknown): message is { role: "user" | "assistant"; content: string } =>
+        !!message &&
+        typeof message === "object" &&
+        (message as { role?: unknown }).role !== undefined &&
+        ["user", "assistant"].includes(String((message as { role: unknown }).role)) &&
+        typeof (message as { content?: unknown }).content === "string"
+    );
+
+    if (!messages.length || messages[messages.length - 1].role !== "user") {
+      return Response.json(
+        { error: "The conversation must end with a user message." },
+        { status: 400 }
+      );
+    }
+
     const systemPrompt = `You are Nemotron Code AI, an expert programming assistant. Help with writing, debugging, explaining, optimizing and converting code. Support Python, JavaScript, TypeScript, React, Next.js, Node.js, HTML/CSS, PHP, SQL and APIs. When project context is provided, ground your answer in the actual files and filenames. When the user asks to modify a project, give exact file paths and complete replacement snippets where useful. Never reveal private API keys, environment values, or hidden credentials.${
       projectContext
         ? `\n\nPROJECT CONTEXT:\n${projectContext}`
         : ""
     }`;
+
+    const requestBody: Record<string, unknown> = {
+      model: MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...messages,
+      ],
+      max_tokens: 16384,
+      reasoning_effort: thinking ? "high" : "none",
+      stream: true,
+    };
+
+    // NVIDIA's API only accepts reasoning_budget from -1 to 32768.
+    // Do NOT send 0 when thinking is disabled; that was the source of the
+    // persistent HTTP 400 responses in the previous deployment.
+    if (thinking) {
+      requestBody.reasoning_budget = 8192;
+    }
 
     const upstream = await fetch(NVIDIA_URL, {
       method: "POST",
@@ -40,19 +76,7 @@ export async function POST(req: Request) {
         "Content-Type": "application/json",
         Accept: "text/event-stream",
       },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...messages,
-        ],
-        temperature: 1,
-        top_p: 0.95,
-        max_tokens: 16384,
-        reasoning_effort: thinking ? "high" : "none",
-        reasoning_budget: thinking ? 8192 : 0,
-        stream: true,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     if (!upstream.ok) {
@@ -61,14 +85,17 @@ export async function POST(req: Request) {
       return Response.json(
         {
           error: `NVIDIA API returned HTTP ${upstream.status}.`,
-          detail: detail.slice(0, 2000),
+          detail: detail.slice(0, 4000),
         },
         { status: 502 }
       );
     }
 
     if (!upstream.body) {
-      return Response.json({ error: "NVIDIA API returned an empty stream." }, { status: 502 });
+      return Response.json(
+        { error: "NVIDIA API returned an empty stream." },
+        { status: 502 }
+      );
     }
 
     const reader = upstream.body.getReader();
@@ -101,10 +128,14 @@ export async function POST(req: Request) {
                 const reasoning = delta?.reasoning_content;
 
                 if (reasoning) {
-                  controller.enqueue(encoder.encode(sse({ type: "reasoning", content: reasoning })));
+                  controller.enqueue(
+                    encoder.encode(sse({ type: "reasoning", content: reasoning }))
+                  );
                 }
                 if (content) {
-                  controller.enqueue(encoder.encode(sse({ type: "content", content })));
+                  controller.enqueue(
+                    encoder.encode(sse({ type: "content", content }))
+                  );
                 }
               } catch {
                 // Ignore incomplete/non-JSON SSE lines; the upstream stream continues.
@@ -120,7 +151,10 @@ export async function POST(req: Request) {
             encoder.encode(
               sse({
                 type: "error",
-                error: error instanceof Error ? error.message : "Generation failed while streaming from NVIDIA.",
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : "Generation failed while streaming from NVIDIA.",
               })
             )
           );
@@ -143,7 +177,10 @@ export async function POST(req: Request) {
     console.error("Chat route error", error);
     return Response.json(
       {
-        error: error instanceof Error ? error.message : "Something went wrong while contacting NVIDIA API.",
+        error:
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while contacting NVIDIA API.",
       },
       { status: 500 }
     );
