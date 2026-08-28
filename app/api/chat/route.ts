@@ -20,54 +20,48 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json();
-    const incomingMessages = Array.isArray(body?.messages) ? body.messages : [];
+    const incoming = Array.isArray(body?.messages) ? body.messages : [];
     const thinking = Boolean(body?.thinking);
-    const projectContext =
-      typeof body?.projectContext === "string"
-        ? body.projectContext.slice(0, 140_000)
-        : "";
+    const projectContext = typeof body?.projectContext === "string"
+      ? body.projectContext.slice(0, 140_000)
+      : "";
 
-    // NVIDIA requires the last message to be a user message and the
-    // user/assistant messages to alternate. The client already sends that shape.
-    const messages = incomingMessages.filter(
-      (message: unknown): message is { role: "user" | "assistant"; content: string } =>
-        !!message &&
-        typeof message === "object" &&
-        (message as { role?: unknown }).role !== undefined &&
-        ["user", "assistant"].includes(String((message as { role: unknown }).role)) &&
-        typeof (message as { content?: unknown }).content === "string"
+    const messages = incoming.filter(
+      (m: unknown): m is { role: "user" | "assistant"; content: string } =>
+        !!m && typeof m === "object" &&
+        (((m as { role?: unknown }).role === "user") || ((m as { role?: unknown }).role === "assistant")) &&
+        typeof (m as { content?: unknown }).content === "string"
     );
 
     if (!messages.length || messages[messages.length - 1].role !== "user") {
-      return Response.json(
-        { error: "The conversation must end with a user message." },
-        { status: 400 }
-      );
+      return Response.json({ error: "The conversation must end with a user message." }, { status: 400 });
     }
 
-    const systemPrompt = `You are Nemotron Code AI, an expert programming assistant. Help with writing, debugging, explaining, optimizing and converting code. Support Python, JavaScript, TypeScript, React, Next.js, Node.js, HTML/CSS, PHP, SQL and APIs. When project context is provided, ground your answer in the actual files and filenames. When the user asks to modify a project, give exact file paths and complete replacement snippets where useful. Never reveal private API keys, environment values, or hidden credentials.${
-      projectContext
-        ? `\n\nPROJECT CONTEXT:\n${projectContext}`
-        : ""
+    const systemPrompt = `You are Nemotron Code AI, an expert programming assistant. Help with writing, debugging, explaining, optimizing and converting code. Support Python, JavaScript, TypeScript, React, Next.js, Node.js, HTML/CSS, PHP, SQL and APIs. When project context is provided, ground your answer in the actual files and filenames. When asked to modify a project, give exact file paths and complete replacement snippets where useful. Never reveal private API keys, environment values, or hidden credentials.${
+      projectContext ? `\n\nPROJECT CONTEXT:\n${projectContext}` : ""
     }`;
 
-    const requestBody: Record<string, unknown> = {
+    // NVIDIA's current Nemotron API documents reasoning through the chat template.
+    // This is intentionally sent as chat_template_kwargs instead of mixing older
+    // client-side parameter conventions into the raw HTTP request.
+    const chatTemplateKwargs: Record<string, unknown> = {
+      enable_thinking: thinking,
+      force_nonempty_content: true,
+    };
+    if (thinking) chatTemplateKwargs.reasoning_budget = 8192;
+
+    const requestBody = {
       model: MODEL,
       messages: [
         { role: "system", content: systemPrompt },
         ...messages,
       ],
-      max_tokens: 16384,
-      reasoning_effort: thinking ? "high" : "none",
+      max_tokens: 16000,
+      temperature: 1,
+      top_p: 0.95,
       stream: true,
+      chat_template_kwargs: chatTemplateKwargs,
     };
-
-    // NVIDIA's API only accepts reasoning_budget from -1 to 32768.
-    // Do NOT send 0 when thinking is disabled; that was the source of the
-    // persistent HTTP 400 responses in the previous deployment.
-    if (thinking) {
-      requestBody.reasoning_budget = 8192;
-    }
 
     const upstream = await fetch(NVIDIA_URL, {
       method: "POST",
@@ -83,19 +77,13 @@ export async function POST(req: Request) {
       const detail = await upstream.text();
       console.error("NVIDIA API error", upstream.status, detail);
       return Response.json(
-        {
-          error: `NVIDIA API returned HTTP ${upstream.status}.`,
-          detail: detail.slice(0, 4000),
-        },
+        { error: `NVIDIA API returned HTTP ${upstream.status}.`, detail: detail.slice(0, 4000) },
         { status: 502 }
       );
     }
 
     if (!upstream.body) {
-      return Response.json(
-        { error: "NVIDIA API returned an empty stream." },
-        { status: 502 }
-      );
+      return Response.json({ error: "NVIDIA API returned an empty stream." }, { status: 502 });
     }
 
     const reader = upstream.body.getReader();
@@ -110,36 +98,39 @@ export async function POST(req: Request) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
-
-            const lines = buffer.split("\n");
+            const lines = buffer.split(/\r?\n/);
             buffer = lines.pop() ?? "";
 
             for (const rawLine of lines) {
               const line = rawLine.trim();
               if (!line.startsWith("data:")) continue;
               const data = line.slice(5).trim();
-              if (!data || data === "[DONE]") continue;
-
+              if (!data) continue;
+              if (data === "[DONE]") {
+                controller.enqueue(encoder.encode(sse({ type: "done" })));
+                continue;
+              }
               try {
                 const parsed = JSON.parse(data);
-                const choice = parsed?.choices?.[0];
-                const delta = choice?.delta;
+                const delta = parsed?.choices?.[0]?.delta;
                 const content = delta?.content;
-                const reasoning = delta?.reasoning_content;
-
-                if (reasoning) {
-                  controller.enqueue(
-                    encoder.encode(sse({ type: "reasoning", content: reasoning }))
-                  );
-                }
-                if (content) {
-                  controller.enqueue(
-                    encoder.encode(sse({ type: "content", content }))
-                  );
-                }
+                if (content) controller.enqueue(encoder.encode(sse({ type: "content", content })));
+                // Do not expose hidden chain-of-thought to the browser.
+                if (delta?.reasoning_content) controller.enqueue(encoder.encode(sse({ type: "status", content: "Generating response..." })));
               } catch {
-                // Ignore incomplete/non-JSON SSE lines; the upstream stream continues.
+                // Ignore malformed/incomplete SSE lines and keep reading.
               }
+            }
+          }
+
+          if (buffer.trim().startsWith("data:")) {
+            const data = buffer.trim().slice(5).trim();
+            if (data && data !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(data);
+                const content = parsed?.choices?.[0]?.delta?.content;
+                if (content) controller.enqueue(encoder.encode(sse({ type: "content", content })));
+              } catch {}
             }
           }
 
@@ -147,17 +138,10 @@ export async function POST(req: Request) {
           controller.close();
         } catch (error) {
           console.error("NVIDIA stream error", error);
-          controller.enqueue(
-            encoder.encode(
-              sse({
-                type: "error",
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : "Generation failed while streaming from NVIDIA.",
-              })
-            )
-          );
+          controller.enqueue(encoder.encode(sse({
+            type: "error",
+            error: error instanceof Error ? error.message : "Generation failed while streaming from NVIDIA.",
+          })));
           controller.close();
         } finally {
           reader.releaseLock();
@@ -175,14 +159,8 @@ export async function POST(req: Request) {
     });
   } catch (error) {
     console.error("Chat route error", error);
-    return Response.json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Something went wrong while contacting NVIDIA API.",
-      },
-      { status: 500 }
-    );
+    return Response.json({
+      error: error instanceof Error ? error.message : "Something went wrong while contacting NVIDIA API.",
+    }, { status: 500 });
   }
 }
