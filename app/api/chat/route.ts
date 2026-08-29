@@ -4,8 +4,10 @@ export const maxDuration = 300;
 
 const MODEL = "nvidia/nemotron-3-ultra-550b-a55b";
 const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
-const sse = (payload: unknown) => `data: ${JSON.stringify(payload)}\n\n`;
+const MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
+
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+const sse = (payload: unknown) => `data: ${JSON.stringify(payload)}\n\n`;
 
 function cleanMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value)) return [];
@@ -19,21 +21,43 @@ function cleanMessages(value: unknown): ChatMessage[] {
     .map(x => ({ role: x.role as "user" | "assistant", content: x.content }));
 }
 
+function normalizeApiKey(value: string) {
+  let key = value.trim();
+  key = key.replace(/^Bearer\s+/i, "").trim();
+  if (
+    (key.startsWith('"') && key.endsWith('"')) ||
+    (key.startsWith("'") && key.endsWith("'"))
+  ) {
+    key = key.slice(1, -1).trim();
+  }
+  return key;
+}
+
 function isContinuation(messages: ChatMessage[]) {
   const last = messages[messages.length - 1]?.content?.toLowerCase() || "";
   return last.startsWith("continue exactly where") || last.includes("continue any file blocks");
 }
 
-async function callNvidia(apiKey: string, messages: ChatMessage[], thinking: boolean, maxTokens: number) {
+function authHeaders(apiKey: string, accept = "application/json") {
+  return {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    Accept: accept,
+  };
+}
+
+async function callNvidia(
+  apiKey: string,
+  model: string,
+  messages: ChatMessage[],
+  thinking: boolean,
+  maxTokens: number,
+) {
   return fetch(NVIDIA_URL, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
+    headers: authHeaders(apiKey, "text/event-stream, application/json"),
     body: JSON.stringify({
-      model: MODEL,
+      model,
       messages,
       max_tokens: maxTokens,
       temperature: 1,
@@ -49,11 +73,103 @@ async function callNvidia(apiKey: string, messages: ChatMessage[], thinking: boo
   });
 }
 
+async function diagnose404(apiKey: string) {
+  try {
+    const response = await fetch(MODELS_URL, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      cache: "no-store",
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      return { kind: "auth" as const, status: response.status, detail: text.slice(0, 1500) };
+    }
+    let data: any = {};
+    try { data = JSON.parse(text); } catch {}
+    const ids = Array.isArray(data?.data)
+      ? data.data.map((x: any) => x?.id).filter((x: any): x is string => typeof x === "string")
+      : [];
+    return {
+      kind: ids.includes(MODEL) ? "model-present" as const : "model-missing" as const,
+      status: response.status,
+      ids: ids.filter((id: string) => id.toLowerCase().includes("nemotron")).slice(0, 20),
+    };
+  } catch (error) {
+    return {
+      kind: "network" as const,
+      status: 0,
+      detail: error instanceof Error ? error.message : "Unable to reach NVIDIA.",
+    };
+  }
+}
+
+async function nvidiaErrorResponse(apiKey: string, status: number, detail: string) {
+  if (status === 404) {
+    const diagnosis = await diagnose404(apiKey);
+
+    if (diagnosis.kind === "auth") {
+      return Response.json(
+        {
+          error: "NVIDIA API authentication/permission failed.",
+          detail:
+            `NVIDIA returned HTTP 404 and the API key could not access /v1/models (HTTP ${diagnosis.status}). ` +
+            "Create a fresh NVIDIA key with Public API Endpoints permission and replace NVIDIA_API_KEY in Vercel.",
+        },
+        { status: 502 },
+      );
+    }
+
+    if (diagnosis.kind === "model-missing") {
+      return Response.json(
+        {
+          error: "Nemotron 3 Ultra is not available to this NVIDIA API key.",
+          detail:
+            `The key can reach NVIDIA, but "${MODEL}" is not present in its /v1/models catalog. ` +
+            "Refresh/regenerate the NVIDIA key at build.nvidia.com and make sure Public API Endpoints access is enabled.",
+          availableNemotronModels: diagnosis.ids,
+        },
+        { status: 502 },
+      );
+    }
+
+    if (diagnosis.kind === "network") {
+      return Response.json(
+        { error: "NVIDIA returned HTTP 404 and the model-catalog check could not run.", detail: diagnosis.detail },
+        { status: 502 },
+      );
+    }
+
+    return null;
+  }
+
+  if (status === 401 || status === 403) {
+    return Response.json(
+      {
+        error: `NVIDIA API authorization failed (HTTP ${status}).`,
+        detail:
+          "Check that NVIDIA_API_KEY is a current nvapi key with Public API Endpoints permission. " +
+          "Do not include the word 'Bearer', quotes, or a curl command in the Vercel variable.",
+      },
+      { status: 502 },
+    );
+  }
+
+  return Response.json(
+    { error: `NVIDIA API returned HTTP ${status}.`, detail: detail.slice(0, 6000) },
+    { status: 502 },
+  );
+}
+
 export async function POST(req: Request) {
   try {
-    const apiKey = process.env.NVIDIA_API_KEY;
+    const rawKey = process.env.NVIDIA_API_KEY || "";
+    const apiKey = normalizeApiKey(rawKey);
+
     if (!apiKey) {
-      return Response.json({ error: "NVIDIA_API_KEY is missing in Vercel Environment Variables." }, { status: 500 });
+      return Response.json(
+        { error: "NVIDIA_API_KEY is missing in Vercel Environment Variables." },
+        { status: 500 },
+      );
     }
 
     const body = await req.json();
@@ -64,11 +180,12 @@ export async function POST(req: Request) {
     const projectContext = typeof body?.projectContext === "string" ? body.projectContext.slice(0, 120000) : "";
 
     if (!incoming.length || incoming[incoming.length - 1].role !== "user") {
-      return Response.json({ error: "The last conversation message must be from the user." }, { status: 400 });
+      return Response.json(
+        { error: "The last conversation message must be from the user." },
+        { status: 400 },
+      );
     }
 
-    // Continuation calls do not need the full uploaded ZIP/context again. This keeps
-    // subsequent requests small and avoids wasting the 60s Hobby execution window.
     const systemPrompt = `You are Nemotron Code AI, a professional full-stack coding agent.
 Give COMPLETE, useful answers. When the user asks to build a website, application, or project, generate the actual runnable implementation, not just an explanation.
 For coding/project tasks:
@@ -89,20 +206,31 @@ ${!continuation && projectContext ? `\nUPLOADED PROJECT CONTEXT:\n${projectConte
       ...incoming,
     ];
 
-    // Keep individual calls small enough for Vercel Hobby's current execution window.
-    // Continuations are deliberately non-thinking so they return useful content quickly.
     const maxTokens = thinking ? 3200 : 5000;
-    let upstream = await callNvidia(apiKey, requestMessages, thinking, maxTokens);
+    let upstream = await callNvidia(apiKey, MODEL, requestMessages, thinking, maxTokens);
 
     if (!upstream.ok) {
       const detail = await upstream.text();
       console.error("NVIDIA API", upstream.status, detail);
-      return Response.json(
-        { error: `NVIDIA API returned HTTP ${upstream.status}.`, detail: detail.slice(0, 6000) },
-        { status: 502 },
-      );
+
+      const handled = await nvidiaErrorResponse(apiKey, upstream.status, detail);
+      if (handled) return handled;
+
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      upstream = await callNvidia(apiKey, MODEL, requestMessages, thinking, maxTokens);
+      if (!upstream.ok) {
+        const retryDetail = await upstream.text();
+        console.error("NVIDIA API retry", upstream.status, retryDetail);
+        return Response.json(
+          { error: `NVIDIA API returned HTTP ${upstream.status} after retry.`, detail: retryDetail.slice(0, 6000) },
+          { status: 502 },
+        );
+      }
     }
-    if (!upstream.body) return Response.json({ error: "NVIDIA returned an empty response stream." }, { status: 502 });
+
+    if (!upstream.body) {
+      return Response.json({ error: "NVIDIA returned an empty response stream." }, { status: 502 });
+    }
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
@@ -135,9 +263,9 @@ ${!continuation && projectContext ? `\nUPLOADED PROJECT CONTEXT:\n${projectConte
           if (typeof choice?.finish_reason === "string") finishReason = choice.finish_reason;
         };
 
-        const consume = async () => {
+        const consume = async (streamReader: ReadableStreamDefaultReader<Uint8Array>) => {
           while (true) {
-            const { value, done } = await reader.read();
+            const { value, done } = await streamReader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split(/\r?\n/);
@@ -161,17 +289,14 @@ ${!continuation && projectContext ? `\nUPLOADED PROJECT CONTEXT:\n${projectConte
         };
 
         try {
-          await consume();
+          await consume(reader);
 
-          // A continuation occasionally returns reasoning metadata but no visible
-          // content. Retry once as a short, non-thinking completion. The retry is
-          // only used when the first upstream call produced zero visible content.
           if (!sentContent && (continuation || reasoningSeen)) {
             retriedNoContent = true;
             try { reader.releaseLock(); } catch {}
-            upstream = await callNvidia(apiKey, requestMessages, false, 3500);
-            if (upstream.ok && upstream.body) {
-              const retryReader = upstream.body.getReader();
+            const retry = await callNvidia(apiKey, MODEL, requestMessages, false, 3500);
+            if (retry.ok && retry.body) {
+              const retryReader = retry.body.getReader();
               buffer = "";
               const retryDecoder = new TextDecoder();
               while (true) {
@@ -201,9 +326,12 @@ ${!continuation && projectContext ? `\nUPLOADED PROJECT CONTEXT:\n${projectConte
           }
 
           if (!sentContent) {
-            send({ type: "error", error: retriedNoContent
-              ? "NVIDIA returned no visible answer after an automatic retry. Turn Thinking Mode off and retry this message."
-              : "NVIDIA returned no visible answer." });
+            send({
+              type: "error",
+              error: retriedNoContent
+                ? "NVIDIA returned no visible answer after an automatic retry. Turn Thinking Mode off and retry this message."
+                : "NVIDIA returned no visible answer.",
+            });
           } else if (finishReason === "length") {
             send({ type: "continue", reason: "length" });
           } else {
@@ -231,6 +359,9 @@ ${!continuation && projectContext ? `\nUPLOADED PROJECT CONTEXT:\n${projectConte
     });
   } catch (error) {
     console.error("Chat route error", error);
-    return Response.json({ error: error instanceof Error ? error.message : "Unexpected server error." }, { status: 500 });
+    return Response.json(
+      { error: error instanceof Error ? error.message : "Unexpected server error." },
+      { status: 500 },
+    );
   }
 }
